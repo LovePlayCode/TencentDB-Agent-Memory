@@ -18,7 +18,7 @@ import type { MemoryPromptMode } from "../../config.js";
 import type { ExtractedMemory, MemoryRecord, DedupDecision, MemoryType } from "./l1-writer.js";
 import { formatBatchConflictPrompt, getConflictDetectionSystemPrompt } from "../prompts/l1-dedup.js";
 import type { CandidateMatch } from "../prompts/l1-dedup.js";
-import { uniqueSortedTimestamps } from "./l1-timestamps.js";
+import { timestampsFromSearchHit, uniqueSortedTimestamps } from "./l1-timestamps.js";
 import { CleanContextRunner } from "../../utils/clean-context-runner.js";
 import { sanitizeJsonForParse } from "../../utils/sanitize.js";
 import type { IMemoryStore, IsolationFilter, L1SearchResult } from "../store/types.js";
@@ -187,7 +187,7 @@ async function runLlmJudgment(
     }
 
     const decisions = parseBatchResult(result, memories, logger);
-    return applyDedupProvenance(decisions, matches);
+    return applyDedupProvenance(decisions, matches, logger);
   } catch (err) {
     logger?.warn?.(
       `${TAG} Batch conflict detection failed, defaulting all to store: ${err instanceof Error ? err.message : String(err)}`,
@@ -215,7 +215,7 @@ function hitToMemoryRecord(r: L1SearchResult): MemoryRecord {
     metadata: r.metadata_json
       ? (() => { try { return JSON.parse(r.metadata_json); } catch { return {}; } })()
       : {},
-    timestamps: [r.timestamp_str].filter(Boolean),
+    timestamps: timestampsFromSearchHit(r),
     createdAt: "",
     updatedAt: "",
     sessionKey: r.session_key,
@@ -414,16 +414,20 @@ function parseBatchResult(
 }
 
 /**
- * Restrict target_ids to the unified candidate pool of this batch, then set
- * `merged_timestamps` to the sorted union of the new memory's source timestamps
- * and the selected candidates' timestamps.
+ * Fill `merged_timestamps` from code (new-memory source times ∪ selected
+ * candidate times). Model-invented timestamps are ignored.
  *
- * Allowed targets = the unified pool shown to the model (not every L1 record).
- * Hallucinated IDs and model-invented timestamps are dropped, not thrown.
+ * Merge/update is kept only when the new memory has source timestamps AND every
+ * non-blank listed target is in this batch's unified candidate pool. Otherwise
+ * fall back to `store` with the original memory (no merged_content, no target
+ * deletes): missing provenance, empty targets, all-invalid IDs, and mixed
+ * valid/invalid targets must not replace existing records. Hallucinated IDs are
+ * not silently dropped from a merge/update. Blank ids are ignored, not mixed.
  */
 export function applyDedupProvenance(
   decisions: DedupDecision[],
   matches: CandidateMatch[],
+  logger?: Logger,
 ): DedupDecision[] {
   const pool = new Map<string, MemoryRecord>();
   const memoryById = new Map<string, ExtractedMemory & { record_id: string }>();
@@ -435,10 +439,27 @@ export function applyDedupProvenance(
   }
 
   return decisions.map((decision) => {
-    const allowedTargets = decision.target_ids.filter((id) => pool.has(id));
+    const listedTargets = decision.target_ids.filter((id) => id.trim() !== "");
+    const allowedTargets = listedTargets.filter((id) => pool.has(id));
     const mem = memoryById.get(decision.record_id);
+    const sourceTimestamps = uniqueSortedTimestamps(mem?.timestamps ?? []);
+
+    if (decision.action === "merge" || decision.action === "update") {
+      const reason = mergeUpdateStoreReason(
+        sourceTimestamps.length,
+        allowedTargets.length,
+        listedTargets.length,
+      );
+      if (reason) {
+        logger?.warn?.(
+          `${TAG} Falling back to store for ${decision.record_id} (${decision.action} → store, reason=${reason})`,
+        );
+        return storeOriginalMemory(decision);
+      }
+    }
+
     const union = uniqueSortedTimestamps([
-      ...(mem?.timestamps ?? []),
+      ...sourceTimestamps,
       ...allowedTargets.flatMap((id) => pool.get(id)?.timestamps ?? []),
     ]);
     return {
@@ -447,6 +468,25 @@ export function applyDedupProvenance(
       merged_timestamps: union.length > 0 ? union : undefined,
     };
   });
+}
+
+function mergeUpdateStoreReason(
+  sourceTimestampCount: number,
+  allowedTargetCount: number,
+  listedTargetCount: number,
+): "empty_source_timestamps" | "no_valid_targets" | "mixed_targets" | undefined {
+  if (sourceTimestampCount === 0) return "empty_source_timestamps";
+  if (allowedTargetCount === 0) return "no_valid_targets";
+  if (allowedTargetCount !== listedTargetCount) return "mixed_targets";
+  return undefined;
+}
+
+function storeOriginalMemory(decision: DedupDecision): DedupDecision {
+  return {
+    record_id: decision.record_id,
+    action: "store",
+    target_ids: [],
+  };
 }
 
 /**
